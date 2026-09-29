@@ -286,8 +286,8 @@ def sync_mssql_to_mysql(mssql_conn, mysql_cache):
         item_rows = mssql_cursor.fetchall()
 
         sql_ins_item = """
-        INSERT INTO items (inventcode, name, measurecode, inventgroup) 
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO items (inventcode, name, measurecode, inventgroup, effectivedate) 
+        VALUES (%s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE 
             name=VALUES(name), 
             measurecode=VALUES(measurecode),
@@ -298,7 +298,8 @@ def sync_mssql_to_mysql(mssql_conn, mysql_cache):
                 str(r.inventcode), 
                 r.name, 
                 r.measurecode, 
-                str(r.inventgroup) if r.inventgroup else None
+                str(r.inventgroup) if r.inventgroup else None,
+                r.effectivedate
             ) 
             for r in item_rows
         ]
@@ -311,7 +312,7 @@ def sync_mssql_to_mysql(mssql_conn, mysql_cache):
         barcode_rows = mssql_cursor.fetchall()
 
         sql_ins_bar = """
-        INSERT IGNORE INTO barcodes (barcode, inventcode, name, measure, tmctype, quantdefault) 
+        INSERT INTO barcodes (barcode, inventcode, name, measure, tmctype, quantdefault) 
         VALUES (%s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE 
             inventcode=VALUES(inventcode), 
@@ -340,8 +341,8 @@ def sync_mssql_to_mysql(mssql_conn, mysql_cache):
         price_rows = mssql_cursor.fetchall()
 
         sql_ins_price = """
-        INSERT INTO prices (barcode, price, minprice, pricetype, doctype, documentid) 
-        VALUES (%s, %s, %s, 3, 1, %s)
+        INSERT INTO prices (barcode, price, minprice, pricetype, doctype, documentid, effectivedate) 
+        VALUES (%s, %s, %s, 3, 1, %s, %s)
         ON DUPLICATE KEY UPDATE 
             price=VALUES(price), 
             minprice=VALUES(minprice),
@@ -352,7 +353,8 @@ def sync_mssql_to_mysql(mssql_conn, mysql_cache):
                 str(r.barcode), 
                 r.price, 
                 r.price, 
-                str(CONFIG["exchange"]["dept_code"])
+                str(CONFIG["exchange"]["dept_code"]),
+                r.effectivedate
             ) 
             for r in price_rows
         ]
@@ -365,11 +367,11 @@ def sync_mssql_to_mysql(mssql_conn, mysql_cache):
         add_price_rows = mssql_cursor.fetchall()
 
         sql_ins_add_price = """
-        INSERT INTO additional_prices (barcode, pricecode, additional_price, pricename) 
-        VALUES (%s, 1, %s, 'Уценка')
+        INSERT INTO additional_prices (barcode, pricecode, additional_price, pricename, effectivedate) 
+        VALUES (%s, 1, %s, 'Уценка', %s)
         ON DUPLICATE KEY UPDATE additional_price=VALUES(additional_price);
         """
-        add_price_data = [(str(r.barcode), r.additional_price) for r in add_price_rows]
+        add_price_data = [(str(r.barcode), r.additional_price, r.effectivedate) for r in add_price_rows]
         mysql_cursor.executemany(sql_ins_add_price, add_price_data)
 
         # 7. Синхронизация пиклиста
@@ -415,6 +417,27 @@ def sync_mssql_to_mysql(mssql_conn, mysql_cache):
         mysql_cursor.executemany(sql_ins_picklist, pick_data)
         logger.info(f"Пиклист обработан. Кэш: hits={stats['cache_hits']}, new_compressed={stats['compressed_new']}")
 
+
+        # 8. Синхронизация списка товаров СЗТ
+        logger.info("Синхронизация items_social...")
+        sql_add_item_social = sql_loader.get_query("09_add_item_social.sql")
+        mssql_cursor.execute(sql_add_item_social)
+        add_item_social_rows = mssql_cursor.fetchall()
+
+        # Используем INSERT IGNORE для пропуска уже существующих записей
+        sql_ins_add_item_social = """
+        INSERT IGNORE INTO items_social (inventcode) 
+        VALUES (%s);
+        """
+
+        # Обратите внимание на запятую после str(r.inventcode) — она делает элемент кортежем!
+        add_item_social_data = [(str(r.inventcode),) for r in add_item_social_rows]
+
+        mysql_cursor.executemany(sql_ins_add_item_social, add_item_social_data)
+
+
+
+
     finally:
         mssql_cursor.close()
         mysql_cursor.close()
@@ -453,10 +476,12 @@ def generate_aif_from_local_db(mysql_cache):
             CASE WHEN u.unitcode = 1 THEN 0 ELSE 1 END AS requirequantityscales,
             CASE WHEN g.is_age_restricted = 1 THEN 18 ELSE 0 END AS age,
             CASE WHEN g.is_age_restricted = 1 THEN 32 ELSE 0 END AS opmode,
-            CASE WHEN g.is_age_restricted = 1 THEN 1 ELSE 0 END AS ageverify
+            CASE WHEN g.is_age_restricted = 1 THEN 1 ELSE 0 END AS ageverify,
+            CASE WHEN i_s.inventcode IS NOT NULL THEN 'social' ELSE NULL END AS extendetoptions
         FROM items i
         LEFT JOIN units u ON i.measurecode = u.unitcode
-        LEFT JOIN invent_groups g ON i.inventgroup = g.group_code;
+        LEFT JOIN invent_groups g ON i.inventgroup = g.group_code
+        LEFT JOIN items_social i_s ON i_s.inventcode = i.inventcode;
         """
         cursor.execute(sql_items_aif)
         for r in cursor.fetchall():
@@ -473,24 +498,25 @@ def generate_aif_from_local_db(mysql_cache):
                         "inventitemoptions": {"ageverify": r["ageverify"]}
                     },
                     "opmode": r["opmode"],
-                    "age": r["age"]
+                    "age": r["age"],
+                    "extendetoptions" : str(r["extendetoptions"])
                 }
             })
 
         # 4. Штрих-коды
         cursor.execute("SELECT inventcode, barcode, name, measure, tmctype, quantdefault FROM barcodes")
         for r in cursor.fetchall():
-            commands.append({"command": "addBarcode", "barcode": {"code": r["inventcode"], "barcode": r["barcode"], "name": r["name"], "measure": r["measure"], "tmctype": r["tmctype"], "quantdefault": float(r["quantdefault"])}})
+            commands.append({"command": "addBarcode", "barcode": {"code": r["inventcode"], "barcode": r["barcode"], "ntin": r["barcode"], "name": r["name"], "measure": r["measure"], "tmctype": r["tmctype"], "quantdefault": float(r["quantdefault"])}})
 
         # 5. Розничные цены
-        cursor.execute("SELECT barcode, price, minprice, pricetype, doctype, documentid FROM prices")
+        cursor.execute("SELECT barcode, price, doctype, documentid, effectivedate FROM prices")
         for r in cursor.fetchall():
-            commands.append({"command": "addPrice", "price": {"barcode": r["barcode"], "price": str(r["price"]), "minprice": str(r["minprice"]), "pricetype": r["pricetype"], "doctype": r["doctype"], "documentid": r["documentid"]}})
+            commands.append({"command": "addPrice", "price": {"barcode": r["barcode"], "price": str(r["price"]), "doctype": r["doctype"], "documentid": r["documentid"], "effectivedate": str(r["effectivedate"])}})
 
         # 6. Дополнительные цены / уценка
-        cursor.execute("SELECT barcode, pricecode, additional_price, pricename FROM additional_prices")
+        cursor.execute("SELECT barcode, pricecode, additional_price, pricename, effectivedate FROM additional_prices")
         for r in cursor.fetchall():
-            commands.append({"command": "addAdditionalPrice", "additionalPrice": {"barcode": r["barcode"], "price": str(r["additional_price"]), "pricecode": r["pricecode"], "pricename": r["pricename"]}})
+            commands.append({"command": "addAdditionalPrice", "additionalPrice": {"barcode": r["barcode"], "price": str(r["additional_price"]), "pricecode": r["pricecode"], "pricename": r["pricename"], "effectivedate":  str(r["effectivedate"]) }})
 
         # 7. Пиклист с подключением кэшированных картинок
         sql_picklist_aif = """
@@ -509,8 +535,7 @@ def generate_aif_from_local_db(mysql_cache):
                     "name": r["name"],
                     "image": r["image"] if r["image"] else "",
                     "parent": r["parent"],
-                    "tmccode": r["tmccode"],
-                    "barcode": r["barcode"],
+                    "tmccode": r["barcode"],
                     "is_category": bool(r["is_category"])
                 }
             })
