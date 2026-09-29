@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Двухэтапный ETL-сервис обмена между MS SQL Express и Artix Control Center (SCO)
+через локальную промежуточную базу данных MySQL (martin_etl).
+
+Этап 1: Выборка и синхронизация мастер-данных из MS SQL -> MySQL (martin_etl)
+Этап 2: Выгрузка файлов обмена (pos.aif + pos.flz) из MySQL (martin_etl)
+"""
+
 import os
 import sys
 import json
@@ -13,17 +21,20 @@ import pyodbc
 import mysql.connector
 from PIL import Image
 
-# 1. Определение корневой директории проекта
+# ==============================================================================
+# 1. РЕЗОЛВИНГ ПУТЕЙ И ИМПОРТ МОДУЛЕЙ
+# ==============================================================================
 PROJECT_ROOT = Path(__file__).resolve().parent
 SRC_DIR = PROJECT_ROOT / "src"
 sys.path.append(str(SRC_DIR))
 
-# Импорт локальных модулей из src/
 from logger_setup import setup_logger
 from backup_manager import backup_and_rotate_aif
 from sql_loader import SQLLoader
 
-# 2. Загрузка конфигурации
+# ==============================================================================
+# 2. ЗАГРУЗКА КОНФИГУРАЦИИ
+# ==============================================================================
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
 
 def load_config(config_file):
@@ -35,7 +46,7 @@ def load_config(config_file):
 
 CONFIG = load_config(CONFIG_PATH)
 
-# Преобразуем относительный путь логов в абсолютный от PROJECT_ROOT
+# Корректировка относительных путей относительно корня проекта
 log_file_setting = CONFIG.get("logging", {}).get("log_file", "log/artix_etl.log")
 if not os.path.isabs(log_file_setting):
     CONFIG["logging"]["log_file"] = str(PROJECT_ROOT / log_file_setting)
@@ -44,13 +55,15 @@ logger = setup_logger(CONFIG.get("logging", {}))
 sql_loader = SQLLoader(PROJECT_ROOT / "sql")
 
 # ==============================================================================
-# УПРАВЛЕНИЕ КЭШЕМ MYSQL
+# 3. КЛАСС РАБОТЫ С ЛОКАЛЬНОЙ БД MYSQL (martin_etl)
 # ==============================================================================
 class LocalCacheMySQL:
+    """Управление кэшем и промежуточными таблицами в MySQL (martin_etl)."""
+    
     def __init__(self, db_config):
         self.config = db_config
 
-    def _get_connection(self):
+    def get_connection(self):
         return mysql.connector.connect(
             host=self.config["host"],
             port=self.config["port"],
@@ -64,7 +77,7 @@ class LocalCacheMySQL:
     def get_image(self, binary_id: int):
         conn = None
         try:
-            conn = self._get_connection()
+            conn = self.get_connection()
             cursor = conn.cursor()
             cursor.execute("SELECT base64_data FROM image_cache WHERE binary_id = %s", (binary_id,))
             row = cursor.fetchone()
@@ -80,7 +93,7 @@ class LocalCacheMySQL:
     def save_image(self, binary_id: int, base64_data: str):
         conn = None
         try:
-            conn = self._get_connection()
+            conn = self.get_connection()
             cursor = conn.cursor()
             sql = """
             INSERT INTO image_cache (binary_id, base64_data) 
@@ -98,7 +111,7 @@ class LocalCacheMySQL:
     def update_sync_state(self, entity_name: str, records_count: int, status: str = "SUCCESS"):
         conn = None
         try:
-            conn = self._get_connection()
+            conn = self.get_connection()
             cursor = conn.cursor()
             sql = """
             INSERT INTO sync_state (entity_name, last_sync, records_processed, status)
@@ -110,7 +123,7 @@ class LocalCacheMySQL:
             """
             cursor.execute(sql, (entity_name, records_count, status))
             cursor.close()
-            logger.info(f"Статус синхронизации '{entity_name}' записан: records={records_count}, status={status}")
+            logger.info(f"Статус синхронизации '{entity_name}' записан: count={records_count}, status={status}")
         except Exception as e:
             logger.error(f"Ошибка фиксации статуса синхронизации: {e}", exc_info=True)
         finally:
@@ -118,7 +131,7 @@ class LocalCacheMySQL:
                 conn.close()
 
 # ==============================================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==============================================================================
 def get_mssql_connection(retries=3, delay=5):
     mssql_conf = CONFIG["mssql"]
@@ -186,85 +199,332 @@ def compress_image_to_base64(image_bytes, cache_mgr, binary_id, stats_dict):
         logger.error(f"Ошибка сжатия картинки binary_id={binary_id}: {e}", exc_info=True)
         return ""
 
+def build_restricted_categories_set(group_rows, root_category_ids):
+    """
+    Рекурсивно разворачивает все дочерние категории для корневых ID алкоголя/табака.
+    """
+    parent_to_children = {}
+    all_category_ids = set()
+
+    for row in group_rows:
+        code = str(row.groupcode)
+        parent = str(row.parentgroupcode) if row.parentgroupcode else None
+        all_category_ids.add(code)
+        if parent:
+            if parent not in parent_to_children:
+                parent_to_children[parent] = []
+            parent_to_children[parent].append(code)
+
+    restricted_set = set()
+    stack = [str(root_id) for root_id in root_category_ids if str(root_id) in all_category_ids]
+
+    while stack:
+        curr_id = stack.pop()
+        restricted_set.add(curr_id)
+        if curr_id in parent_to_children:
+            stack.extend(parent_to_children[curr_id])
+
+    logger.info(f"Определено {len(restricted_set)} подкатегорий 18+ из корневых: {root_category_ids}")
+    return restricted_set
+
 # ==============================================================================
-# ФУНКЦИИ ВЫГРУЗКИ С ИСПОЛЬЗОВАНИЕМ ВЫНЕСЕННЫХ SQL-ФАЙЛОВ
+# 5. ЭТАП 1: СИНХРОНИЗАЦИЯ (MS SQL -> MYSQL martin_etl)
 # ==============================================================================
-def fetch_units(cursor):
-    logger.info("Извлечение единиц измерения (addUnit)...")
-    sql = sql_loader.get_query("01_add_unit.sql")
-    cursor.execute(sql)
-    rows = cursor.fetchall()
-    return [{"command": "addUnit", "unit": {"unitcode": r.unitcode, "name": r.name, "fractional": bool(r.fractional)}} for r in rows]
+def sync_mssql_to_mysql(mssql_conn, mysql_cache):
+    logger.info(">>> СТАРТ ЭТАПА 1: Синхронизация MS SQL -> MySQL (martin_etl)")
+    mssql_cursor = mssql_conn.cursor()
+    mysql_conn = mysql_cache.get_connection()
+    mysql_cursor = mysql_conn.cursor()
 
-def fetch_groups(cursor):
-    logger.info("Извлечение групп товаров (addInventGroup)...")
-    sql = sql_loader.get_query("02_add_invent_group.sql")
-    cursor.execute(sql)
-    rows = cursor.fetchall()
-    return [{"command": "addInventGroup", "inventGroup": {"groupCode": str(r.groupcode), "groupname": r.groupname, "parentGroupCode": str(r.parentgroupcode) if r.parentgroupcode else None}} for r in rows]
+    try:
+        # 1. Синхронизация единиц измерения
+        logger.info("Синхронизация units...")
+        sql_units = sql_loader.get_query("01_add_unit.sql")
+        mssql_cursor.execute(sql_units)
+        unit_rows = mssql_cursor.fetchall()
+        
+        sql_ins_unit = """
+        INSERT INTO units (unitcode, name, fractional) 
+        VALUES (%s, %s, %s)
+        ON DUPLICATE KEY UPDATE name=VALUES(name), fractional=VALUES(fractional);
+        """
+        unit_data = [(r.unitcode, r.name, int(r.fractional)) for r in unit_rows]
+        mysql_cursor.executemany(sql_ins_unit, unit_data)
 
-def fetch_items(cursor):
-    logger.info("Извлечение карточек товаров (addInventItem)...")
-    sql = sql_loader.get_query("03_add_invent_item.sql")
-    cursor.execute(sql, (CONFIG["exchange"]["dept_code"],))
-    rows = cursor.fetchall()
-    return [{
-        "command": "addInventItem",
-        "invent": {
-            "inventcode": str(r.inventcode),
-            "measurecode": str(r.measurecode),
-            "isInventItem": True,
-            "name": r.name,
-            "inventgroup": str(r.inventgroup) if r.inventgroup else None,
-            "options": {"quantityoptions": {"requirequantityscales": bool(r.requirequantityscales)}, "inventitemoptions": {"ageverify": 1 if r.age > 0 else 0}},
-            "opmode": r.opmode,
-            "age": r.age
-        }
-    } for r in rows]
+        # 2. Синхронизация групп товаров (категорий)
+        logger.info("Синхронизация invent_groups...")
+        sql_groups = sql_loader.get_query("02_add_invent_group.sql")
+        mssql_cursor.execute(sql_groups)
+        group_rows = mssql_cursor.fetchall()
 
-def fetch_barcodes(cursor):
-    logger.info("Извлечение штрих-кодов (addBarcode)...")
-    sql = sql_loader.get_query("04_add_barcode.sql")
-    cursor.execute(sql, (CONFIG["exchange"]["dept_code"],))
-    rows = cursor.fetchall()
-    return [{"command": "addBarcode", "barcode": {"code": str(r.code), "barcode": str(r.barcode), "name": r.name, "measure": int(r.measure), "tmctype": int(r.tmctype), "quantdefault": float(r.quantdefault)}} for r in rows]
+        root_cats = CONFIG.get("age_restrictions", {}).get("root_categories", [])
+        restricted_cats = build_restricted_categories_set(group_rows, root_cats)
 
-def fetch_prices(cursor):
-    logger.info("Извлечение розничных цен (addPrice)...")
-    sql = sql_loader.get_query("05_add_price.sql")
-    cursor.execute(sql, (CONFIG["exchange"]["dept_code"],))
-    rows = cursor.fetchall()
-    return [{"command": "addPrice", "price": {"barcode": str(r.barcode), "price": str(r.price), "minprice": str(r.price), "pricetype": 3, "doctype": 1, "documentid": str(CONFIG["exchange"]["dept_code"])}} for r in rows]
+        sql_ins_group = """
+        INSERT INTO invent_groups (group_code, group_name, parent_group_code, is_age_restricted) 
+        VALUES (%s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE 
+            group_name=VALUES(group_name), 
+            parent_group_code=VALUES(parent_group_code),
+            is_age_restricted=VALUES(is_age_restricted);
+        """
+        group_data = [
+            (
+                str(r.groupcode), 
+                r.groupname, 
+                str(r.parentgroupcode) if r.parentgroupcode else None,
+                1 if str(r.groupcode) in restricted_cats else 0
+            ) 
+            for r in group_rows
+        ]
+        mysql_cursor.executemany(sql_ins_group, group_data)
 
-def fetch_additional_prices(cursor):
-    logger.info("Извлечение дополнительных цен/уценки (addAdditionalPrice)...")
-    sql = sql_loader.get_query("06_add_additional_price.sql")
-    cursor.execute(sql, (CONFIG["exchange"]["dept_code"],))
-    rows = cursor.fetchall()
-    return [{"command": "addAdditionalPrice", "additionalPrice": {"barcode": str(r.barcode), "price": str(r.additional_price), "pricecode": 1, "pricename": "Уценка"}} for r in rows]
+        # 3. Синхронизация чистых товаров (items)
+        logger.info("Синхронизация items...")
+        sql_items = sql_loader.get_query("03_add_invent_item.sql")
+        mssql_cursor.execute(sql_items, (CONFIG["exchange"]["dept_code"],))
+        item_rows = mssql_cursor.fetchall()
 
-def fetch_picklist(cursor, cache_mgr):
-    logger.info("Извлечение пиклиста (addPicklist)...")
-    stats = {"cache_hits": 0, "compressed_new": 0}
+        sql_ins_item = """
+        INSERT INTO items (inventcode, name, measurecode, inventgroup) 
+        VALUES (%s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE 
+            name=VALUES(name), 
+            measurecode=VALUES(measurecode),
+            inventgroup=VALUES(inventgroup);
+        """
+        item_data = [
+            (
+                str(r.inventcode), 
+                r.name, 
+                r.measurecode, 
+                str(r.inventgroup) if r.inventgroup else None
+            ) 
+            for r in item_rows
+        ]
+        mysql_cursor.executemany(sql_ins_item, item_data)
+
+        # 4. Синхронизация штрих-кодов
+        logger.info("Синхронизация barcodes...")
+        sql_barcodes = sql_loader.get_query("04_add_barcode.sql")
+        mssql_cursor.execute(sql_barcodes, (CONFIG["exchange"]["dept_code"],))
+        barcode_rows = mssql_cursor.fetchall()
+
+        sql_ins_bar = """
+        INSERT IGNORE INTO barcodes (barcode, inventcode, name, measure, tmctype, quantdefault) 
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE 
+            inventcode=VALUES(inventcode), 
+            name=VALUES(name), 
+            measure=VALUES(measure),
+            tmctype=VALUES(tmctype),
+            quantdefault=VALUES(quantdefault);
+        """
+        barcode_data = [
+            (
+                str(r.barcode), 
+                str(r.code), 
+                r.name, 
+                int(r.measure), 
+                int(r.tmctype), 
+                float(r.quantdefault)
+            ) 
+            for r in barcode_rows
+        ]
+        mysql_cursor.executemany(sql_ins_bar, barcode_data)
+
+        # 5. Синхронизация розничных цен (prices)
+        logger.info("Синхронизация prices...")
+        sql_prices = sql_loader.get_query("05_add_price.sql")
+        mssql_cursor.execute(sql_prices, (CONFIG["exchange"]["dept_code"],))
+        price_rows = mssql_cursor.fetchall()
+
+        sql_ins_price = """
+        INSERT INTO prices (barcode, price, minprice, pricetype, doctype, documentid) 
+        VALUES (%s, %s, %s, 3, 1, %s)
+        ON DUPLICATE KEY UPDATE 
+            price=VALUES(price), 
+            minprice=VALUES(minprice),
+            documentid=VALUES(documentid);
+        """
+        price_data = [
+            (
+                str(r.barcode), 
+                r.price, 
+                r.price, 
+                str(CONFIG["exchange"]["dept_code"])
+            ) 
+            for r in price_rows
+        ]
+        mysql_cursor.executemany(sql_ins_price, price_data)
+
+        # 6. Синхронизация уценки (additional_prices)
+        logger.info("Синхронизация additional_prices...")
+        sql_add_prices = sql_loader.get_query("06_add_additional_price.sql")
+        mssql_cursor.execute(sql_add_prices, (CONFIG["exchange"]["dept_code"],))
+        add_price_rows = mssql_cursor.fetchall()
+
+        sql_ins_add_price = """
+        INSERT INTO additional_prices (barcode, pricecode, additional_price, pricename) 
+        VALUES (%s, 1, %s, 'Уценка')
+        ON DUPLICATE KEY UPDATE additional_price=VALUES(additional_price);
+        """
+        add_price_data = [(str(r.barcode), r.additional_price) for r in add_price_rows]
+        mysql_cursor.executemany(sql_ins_add_price, add_price_data)
+
+        # 7. Синхронизация пиклиста
+        logger.info("Синхронизация picklist...")
+        stats = {"cache_hits": 0, "compressed_new": 0}
+
+        sql_pick_cats = sql_loader.get_query("07_picklist_categories.sql")
+        mssql_cursor.execute(sql_pick_cats)
+        pick_cats = mssql_cursor.fetchall()
+
+        sql_ins_picklist = """
+        INSERT INTO picklist (code, name, binary_id, parent, tmccode, barcode, is_category) 
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE 
+            name=VALUES(name), 
+            binary_id=VALUES(binary_id),
+            parent=VALUES(parent),
+            tmccode=VALUES(tmccode),
+            barcode=VALUES(barcode);
+        """
+
+        pick_data = []
+        for r in pick_cats:
+            compress_image_to_base64(r.image_bytes, mysql_cache, r.binary_id, stats)
+            pick_data.append((str(r.code), r.name, r.binary_id, None, None, None, 1))
+
+        sql_pick_items = sql_loader.get_query("08_picklist_items.sql")
+        mssql_cursor.execute(sql_pick_items)
+        pick_items = mssql_cursor.fetchall()
+
+        for r in pick_items:
+            compress_image_to_base64(r.image_bytes, mysql_cache, r.binary_id, stats)
+            pick_data.append((
+                str(r.raw_code).lstrip('0'), 
+                r.name, 
+                r.binary_id, 
+                str(r.parent) if r.parent else None,
+                str(r.tmccode).lstrip('0'),
+                str(r.barcode) if r.barcode else None,
+                0
+            ))
+
+        mysql_cursor.executemany(sql_ins_picklist, pick_data)
+        logger.info(f"Пиклист обработан. Кэш: hits={stats['cache_hits']}, new_compressed={stats['compressed_new']}")
+
+    finally:
+        mssql_cursor.close()
+        mysql_cursor.close()
+        if mysql_conn and mysql_conn.is_connected():
+            mysql_conn.close()
+
+    logger.info(">>> ЭТАП 1 ЗАВЕРШЕН: База данных martin_etl успешно обновлена.")
+
+# ==============================================================================
+# 6. ЭТАП 2: ВЫГРУЗКА ИЗ MYSQL (martin_etl -> pos.aif)
+# ==============================================================================
+def generate_aif_from_local_db(mysql_cache):
+    logger.info(">>> СТАРТ ЭТАПА 2: Формирование pos.aif из MySQL (martin_etl)")
+    conn = mysql_cache.get_connection()
+    cursor = conn.cursor(dictionary=True)
     commands = []
 
-    sql_cats = sql_loader.get_query("07_picklist_categories.sql")
-    cursor.execute(sql_cats)
-    for r in cursor.fetchall():
-        b64 = compress_image_to_base64(r.image_bytes, cache_mgr, r.binary_id, stats)
-        commands.append({"command": "addPicklist", "picklist": {"code": str(r.code), "name": r.name, "image": b64, "parent": None, "tmccode": None, "barcode": None, "is_category": True}})
+    try:
+        # 1. Единицы измерения
+        cursor.execute("SELECT unitcode, name, fractional FROM units")
+        for r in cursor.fetchall():
+            commands.append({"command": "addUnit", "unit": {"unitcode": r["unitcode"], "name": r["name"], "fractional": bool(r["fractional"])}})
 
-    sql_items = sql_loader.get_query("08_picklist_items.sql")
-    cursor.execute(sql_items)
-    for r in cursor.fetchall():
-        b64 = compress_image_to_base64(r.image_bytes, cache_mgr, r.binary_id, stats)
-        commands.append({"command": "addPicklist", "picklist": {"code": str(r.raw_code).lstrip('0'), "name": r.name, "image": b64, "parent": str(r.parent) if r.parent else None, "tmccode": str(r.tmccode).lstrip('0'), "barcode": str(r.barcode) if r.barcode else None, "is_category": False}})
+        # 2. Группы товаров
+        cursor.execute("SELECT group_code, group_name, parent_group_code FROM invent_groups")
+        for r in cursor.fetchall():
+            commands.append({"command": "addInventGroup", "inventGroup": {"groupCode": r["group_code"], "groupname": r["group_name"], "parentGroupCode": r["parent_group_code"]}})
 
-    logger.info(f"Картинки пиклиста: из кэша={stats['cache_hits']}, сжато заново={stats['compressed_new']}")
+        # 3. Товары (вычисление взвешивания и возраста на лету через JOIN)
+        sql_items_aif = """
+        SELECT 
+            i.inventcode,
+            i.name,
+            i.measurecode,
+            i.inventgroup,
+            CASE WHEN u.unitcode = 1 THEN 0 ELSE 1 END AS requirequantityscales,
+            CASE WHEN g.is_age_restricted = 1 THEN 18 ELSE 0 END AS age,
+            CASE WHEN g.is_age_restricted = 1 THEN 32 ELSE 0 END AS opmode,
+            CASE WHEN g.is_age_restricted = 1 THEN 1 ELSE 0 END AS ageverify
+        FROM items i
+        LEFT JOIN units u ON i.measurecode = u.unitcode
+        LEFT JOIN invent_groups g ON i.inventgroup = g.group_code;
+        """
+        cursor.execute(sql_items_aif)
+        for r in cursor.fetchall():
+            commands.append({
+                "command": "addInventItem",
+                "invent": {
+                    "inventcode": r["inventcode"],
+                    "measurecode": str(r["measurecode"]),
+                    "isInventItem": True,
+                    "name": r["name"],
+                    "inventgroup": r["inventgroup"],
+                    "options": {
+                        "quantityoptions": {"requirequantityscales": bool(r["requirequantityscales"])},
+                        "inventitemoptions": {"ageverify": r["ageverify"]}
+                    },
+                    "opmode": r["opmode"],
+                    "age": r["age"]
+                }
+            })
+
+        # 4. Штрих-коды
+        cursor.execute("SELECT inventcode, barcode, name, measure, tmctype, quantdefault FROM barcodes")
+        for r in cursor.fetchall():
+            commands.append({"command": "addBarcode", "barcode": {"code": r["inventcode"], "barcode": r["barcode"], "name": r["name"], "measure": r["measure"], "tmctype": r["tmctype"], "quantdefault": float(r["quantdefault"])}})
+
+        # 5. Розничные цены
+        cursor.execute("SELECT barcode, price, minprice, pricetype, doctype, documentid FROM prices")
+        for r in cursor.fetchall():
+            commands.append({"command": "addPrice", "price": {"barcode": r["barcode"], "price": str(r["price"]), "minprice": str(r["minprice"]), "pricetype": r["pricetype"], "doctype": r["doctype"], "documentid": r["documentid"]}})
+
+        # 6. Дополнительные цены / уценка
+        cursor.execute("SELECT barcode, pricecode, additional_price, pricename FROM additional_prices")
+        for r in cursor.fetchall():
+            commands.append({"command": "addAdditionalPrice", "additionalPrice": {"barcode": r["barcode"], "price": str(r["additional_price"]), "pricecode": r["pricecode"], "pricename": r["pricename"]}})
+
+        # 7. Пиклист с подключением кэшированных картинок
+        sql_picklist_aif = """
+        SELECT 
+            p.code, p.name, p.parent, p.tmccode, p.barcode, p.is_category,
+            c.base64_data AS image
+        FROM picklist p
+        LEFT JOIN image_cache c ON p.binary_id = c.binary_id;
+        """
+        cursor.execute(sql_picklist_aif)
+        for r in cursor.fetchall():
+            commands.append({
+                "command": "addPicklist",
+                "picklist": {
+                    "code": r["code"],
+                    "name": r["name"],
+                    "image": r["image"] if r["image"] else "",
+                    "parent": r["parent"],
+                    "tmccode": r["tmccode"],
+                    "barcode": r["barcode"],
+                    "is_category": bool(r["is_category"])
+                }
+            })
+
+    finally:
+        cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
+    logger.info(f">>> ЭТАП 2 ЗАВЕРШЕН: Сформировано {len(commands)} команд для AIF-пакета.")
     return commands
 
 # ==============================================================================
-# ПУБЛИКАЦИЯ ФАЙЛОВ ОБМЕНА
+# 7. ПУБЛИКАЦИЯ ПАКЕТА И БЭКАП
 # ==============================================================================
 def publish_aif_package(commands_list):
     target_dir = CONFIG["exchange"]["target_dir"]
@@ -274,60 +534,55 @@ def publish_aif_package(commands_list):
     aif_filepath = os.path.join(target_dir, CONFIG['exchange']['aif_filename'])
     flz_filepath = os.path.join(target_dir, CONFIG['exchange']['flag_filename'])
 
-    logger.info(f"Формирование пакета AIF ({len(commands_list)} команд)...")
+    logger.info(f"Запись пакета AIF ({len(commands_list)} команд) во временный файл: {tmp_filepath}")
     with open(tmp_filepath, "w", encoding="utf-8") as f:
         for cmd in commands_list:
             f.write(json.dumps(cmd, ensure_ascii=False) + "\n" + "---" + "\n")
 
     os.replace(tmp_filepath, aif_filepath)
-    
-    # Бэкап создается в директории, указанной в config.json (или ./backup по умолчанию)
+    logger.info(f"Файл AIF переименован и опубликован: {aif_filepath}")
+
+    # Бэкапирование с ротацией
     backup_conf = CONFIG.get("backup", {})
     if backup_conf.get("enabled", True) and not os.path.isabs(backup_conf.get("backup_dir", "")):
         backup_conf["backup_dir"] = str(PROJECT_ROOT / backup_conf.get("backup_dir", "backup"))
 
     backup_and_rotate_aif(aif_filepath, backup_conf)
 
+    # Создание файла-флага
     with open(flz_filepath, "w", encoding="utf-8") as f:
         pass
-    logger.info("Пакет опубликован и флаг готовности создан.")
+    logger.info(f"Файл-флаг активации импорта создан: {flz_filepath}")
 
 # ==============================================================================
-# MAIN
+# 8. ОСНОВНАЯ ТОЧКА ВХОДА
 # ==============================================================================
 def main():
     start_time = time.time()
-    logger.info("=== Старт выгрузки справочников Artix SCO ===")
+    logger.info("=== Запуск ETL-сервиса обмена Artix SCO ===")
     cache_mgr = LocalCacheMySQL(CONFIG["mysql"])
     
     try:
-        conn = get_mssql_connection()
-        cursor = conn.cursor()
+        # Этап 1: Синхронизация данных из MS SQL в локальную MySQL (martin_etl)
+        mssql_conn = get_mssql_connection()
+        sync_mssql_to_mysql(mssql_conn, cache_mgr)
+        mssql_conn.close()
 
-        all_commands = []
-        all_commands.extend(fetch_units(cursor))
-        all_commands.extend(fetch_groups(cursor))
-        all_commands.extend(fetch_items(cursor))
-        all_commands.extend(fetch_barcodes(cursor))
-        all_commands.extend(fetch_prices(cursor))
-        all_commands.extend(fetch_additional_prices(cursor))
-        all_commands.extend(fetch_picklist(cursor, cache_mgr))
+        # Этап 2: Быстрая выгрузка AIF-файла из локальной MySQL (martin_etl)
+        aif_commands = generate_aif_from_local_db(cache_mgr)
 
-        cursor.close()
-        conn.close()
-
-        if all_commands:
-            publish_aif_package(all_commands)
-            cache_mgr.update_sync_state("full_dictionary_sync", len(all_commands), "SUCCESS")
+        if aif_commands:
+            publish_aif_package(aif_commands)
+            cache_mgr.update_sync_state("full_dictionary_sync", len(aif_commands), "SUCCESS")
             elapsed = time.time() - start_time
-            logger.info(f"=== Выгрузка завершена за {elapsed:.2f} сек. Команд: {len(all_commands)} ===")
+            logger.info(f"=== Процесс успешно завершен за {elapsed:.2f} сек. Всего выгружено: {len(aif_commands)} ===")
         else:
-            logger.warning("Данные для выгрузки не найдены.")
+            logger.warning("Команды для выгрузки не сформированы.")
 
     except Exception as e:
         elapsed = time.time() - start_time
         cache_mgr.update_sync_state("full_dictionary_sync", 0, "ERROR")
-        logger.critical(f"Критический сбой ETL спустя {elapsed:.2f} сек: {e}", exc_info=True)
+        logger.critical(f"Критический сбой процесса ETL спустя {elapsed:.2f} сек: {e}", exc_info=True)
         sys.exit(1)
 
 if __name__ == "__main__":
