@@ -476,7 +476,7 @@ def generate_aif_from_local_db(mysql_cache):
             CASE WHEN g.is_age_restricted = 1 THEN 18 ELSE 0 END AS age,
             CASE WHEN g.is_age_restricted = 1 THEN 32 ELSE 0 END AS opmode,
             CASE WHEN g.is_age_restricted = 1 THEN 1 ELSE 0 END AS ageverify,
-            CASE WHEN i_s.inventcode IS NOT NULL THEN 'social' ELSE NULL END AS extendetoptions
+            CASE WHEN i_s.inventcode IS NOT NULL THEN 'social' ELSE NULL END AS extendedoptions
         FROM items i
         LEFT JOIN units u ON i.measurecode = u.unitcode
         LEFT JOIN invent_groups g ON i.inventgroup = g.group_code
@@ -498,7 +498,7 @@ def generate_aif_from_local_db(mysql_cache):
                     },
                     "opmode": r["opmode"],
                     "age": r["age"],
-                    "extendetoptions" : str(r["extendetoptions"])
+                    "extendedoptions" : str(r["extendedoptions"])
                 }
             })
 
