@@ -9,7 +9,8 @@ SELECT
             CONCAT(goods.[PrekesPavadinimas], ' ', goods.[PrekesKomentaras]), 0, 
             CHARINDEX('[', CONCAT(goods.[PrekesPavadinimas], ' ', goods.[PrekesKomentaras]))
         ), '\', '\\'), CHAR(9), '')) AS name,
-    gp_cat.[ItemCategoryId] AS inventgroup
+    gp_cat.[ItemCategoryId] AS inventgroup,
+    goods.Laikas AS effectivedate
 FROM [rdata].[dbo].[Prekes] goods
 INNER JOIN [GPBO].[dbo].[GP_Items] gp_item 
     ON SUBSTRING(gp_item.[ItemCode], PATINDEX('%[^0]%', gp_item.[ItemCode] + 'a'), LEN(gp_item.[ItemCode])) = goods.[PrekesKodas]
