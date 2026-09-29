@@ -30,7 +30,7 @@
   },
   "logging": {
     "log_file": "/home/pos/scripts/martinn/full/log/artix_etl.log",
-    "level": "INFO",
+    "level": "DEBUG",
     "max_bytes": 10485760,
     "backup_count": 5
   },
