@@ -1,0 +1,5 @@
+# Set your name globally
+git config --global user.name "Nippetyplunk"
+
+# Set a value for current repo only (git repo config)
+git config --local user.email "nikolaichev@tusson.by"
