@@ -1,9 +1,4 @@
-<<<<<<< HEAD
 backup/*
 log/*
 .gitconfig
-=======
-backup/*
-log/*
-
->>>>>>> a8a4bec (second commit)
+config/config.json

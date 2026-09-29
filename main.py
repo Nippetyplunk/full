@@ -430,7 +430,6 @@ def sync_mssql_to_mysql(mssql_conn, mysql_cache):
         VALUES (%s);
         """
 
-        # Обратите внимание на запятую после str(r.inventcode) — она делает элемент кортежем!
         add_item_social_data = [(str(r.inventcode),) for r in add_item_social_rows]
 
         mysql_cursor.executemany(sql_ins_add_item_social, add_item_social_data)
