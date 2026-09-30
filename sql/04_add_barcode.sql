@@ -1,3 +1,4 @@
+-- Запрос для получения штри-кодов товаров и признака маркировки 
 WITH PreparedData AS (
     SELECT 
         goods.[PrekesKodas] AS code,
@@ -13,7 +14,7 @@ WITH PreparedData AS (
     INNER JOIN [rdata].[dbo].[Prekes] goods 
         ON bar.[PrekesKodas] = goods.[PrekesKodas]
     WHERE goods.[Aktyvi] = 1 
-      AND bar.[Dep] = ?
+      AND goods.[Dep] = ?
 )
 SELECT 
     code,

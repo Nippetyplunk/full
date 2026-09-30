@@ -1,9 +1,8 @@
--- ============================================================================
--- ИЗВЛЕЧЕНИЕ ТОВАРОВ ИЗ MS SQL ДЛЯ ЗАПОЛНЕНИЯ ЛОКАЛЬНОЙ БД
--- ============================================================================
+-- Запрос получения товаров 
 SELECT 
     goods.[PrekesKodas] AS inventcode,
     goods.[PrekesMatas] AS measurecode,
+    -- Объяеденинение и форматирование наименования товара
     TRIM(REPLACE(REPLACE(
         SUBSTRING(
             CONCAT(goods.[PrekesPavadinimas], ' ', goods.[PrekesKomentaras]), 0, 

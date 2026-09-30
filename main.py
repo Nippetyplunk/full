@@ -171,9 +171,18 @@ def compress_image_to_base64(image_bytes, cache_mgr, binary_id, stats_dict):
     try:
         stats_dict["compressed_new"] += 1
         img = Image.open(BytesIO(image_bytes))
-        if img.mode in ("RGBA", "P"):
+
+        # Если есть прозрачность (RGBA/P), накладываем на белый фон и переводим в RGB
+        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+            background = Image.new("RGB", img.size, (255, 255, 255))
+            if img.mode == "P":
+                img = img.convert("RGBA")
+            background.paste(img, mask=img.split()[3]) # Используем альфа-канал как маску
+            img = background
+        elif img.mode != "RGB":
             img = img.convert("RGB")
 
+        # Ресемплинг
         try:
             resample_filter = Image.Resampling.LANCZOS
         except AttributeError:
@@ -181,6 +190,7 @@ def compress_image_to_base64(image_bytes, cache_mgr, binary_id, stats_dict):
 
         img.thumbnail((CONFIG["image"]["max_dimension"], CONFIG["image"]["max_dimension"]), resample_filter)
 
+        # Гарантированное сжатие JPEG по значению quality
         quality = 85
         output = BytesIO()
 
@@ -195,9 +205,13 @@ def compress_image_to_base64(image_bytes, cache_mgr, binary_id, stats_dict):
         b64_str = base64.b64encode(output.getvalue()).decode("utf-8")
         cache_mgr.save_image(binary_id, b64_str)
         return b64_str
+
     except Exception as e:
         logger.error(f"Ошибка сжатия картинки binary_id={binary_id}: {e}", exc_info=True)
         return ""
+
+
+
 
 def build_restricted_categories_set(group_rows, root_category_ids):
     """
@@ -520,10 +534,19 @@ def generate_aif_from_local_db(mysql_cache):
         # 7. Пиклист с подключением кэшированных картинок
         sql_picklist_aif = """
         SELECT 
-            p.code, p.name, p.parent, p.tmccode, p.barcode, p.is_category,
-            c.base64_data AS image
-        FROM picklist p
-        LEFT JOIN image_cache c ON p.binary_id = c.binary_id;
+            p.code, 
+            p.name, 
+            p.parent, 
+            p.tmccode, 
+            p.barcode, 
+            c.base64_data AS image,
+            CASE 
+                WHEN p.is_category = 1 THEN p.code 
+                ELSE ROW_NUMBER() OVER (PARTITION BY p.parent ORDER BY p.name) 
+            END AS itemorder
+        FROM martin_etl.picklist p
+        LEFT JOIN martin_etl.image_cache c ON p.binary_id = c.binary_id
+        ORDER BY p.parent, p.name;
         """
         cursor.execute(sql_picklist_aif)
         for r in cursor.fetchall():
@@ -535,7 +558,7 @@ def generate_aif_from_local_db(mysql_cache):
                     "image": r["image"] if r["image"] else "",
                     "parent": r["parent"],
                     "tmccode": r["barcode"],
-                    "is_category": bool(r["is_category"])
+                    "itemorder": r["itemorder"]
                 }
             })
 
