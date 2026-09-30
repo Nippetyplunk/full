@@ -2,17 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Двухэтапный ETL-сервис обмена между MS SQL Express и Artix Control Center (SCO)
-через локальную промежуточную базу данных MySQL (martin_etl).
 
-Этап 1: Выборка и синхронизация мастер-данных из MS SQL -> MySQL (martin_etl)
-Этап 2: Выгрузка файлов обмена (pos.aif + pos.flz) из MySQL (martin_etl)
 """
 
 import os
 import sys
 import json
 import time
+from datetime import datetime, timedelta
 import base64
 from pathlib import Path
 from io import BytesIO
@@ -245,6 +242,7 @@ def build_restricted_categories_set(group_rows, root_category_ids):
 # 5. ЭТАП 1: СИНХРОНИЗАЦИЯ (MS SQL -> MYSQL martin_etl)
 # ==============================================================================
 def sync_mssql_to_mysql(mssql_conn, mysql_cache):
+    entities = CONFIG.get("entities", {})
     logger.info(">>> СТАРТ ЭТАПА 1: Синхронизация MS SQL -> MySQL (martin_etl)")
     mssql_cursor = mssql_conn.cursor()
     mysql_conn = mysql_cache.get_connection()
@@ -252,204 +250,215 @@ def sync_mssql_to_mysql(mssql_conn, mysql_cache):
 
     try:
         # 1. Синхронизация единиц измерения
-        logger.info("Синхронизация units...")
-        sql_units = sql_loader.get_query("01_add_unit.sql")
-        mssql_cursor.execute(sql_units)
-        unit_rows = mssql_cursor.fetchall()
-        
-        sql_ins_unit = """
-        INSERT INTO units (unitcode, name, fractional) 
-        VALUES (%s, %s, %s)
-        ON DUPLICATE KEY UPDATE name=VALUES(name), fractional=VALUES(fractional);
-        """
-        unit_data = [(r.unitcode, r.name, int(r.fractional)) for r in unit_rows]
-        mysql_cursor.executemany(sql_ins_unit, unit_data)
+        if entities.get("units", True):
+            logger.info("Синхронизация units...")
+            sql_units = sql_loader.get_query("01_add_unit.sql")
+            mssql_cursor.execute(sql_units)
+            unit_rows = mssql_cursor.fetchall()
+            
+            sql_ins_unit = """
+            INSERT INTO units (unitcode, name, fractional) 
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE name=VALUES(name), fractional=VALUES(fractional);
+            """
+            unit_data = [(r.unitcode, r.name, int(r.fractional)) for r in unit_rows]
+            mysql_cursor.executemany(sql_ins_unit, unit_data)
 
         # 2. Синхронизация групп товаров (категорий)
-        logger.info("Синхронизация invent_groups...")
-        sql_groups = sql_loader.get_query("02_add_invent_group.sql")
-        mssql_cursor.execute(sql_groups)
-        group_rows = mssql_cursor.fetchall()
+        if entities.get("groups", True):
+            logger.info("Синхронизация invent_groups...")
+            sql_groups = sql_loader.get_query("02_add_invent_group.sql")
+            mssql_cursor.execute(sql_groups)
+            group_rows = mssql_cursor.fetchall()
 
-        root_cats = CONFIG.get("age_restrictions", {}).get("root_categories", [])
-        restricted_cats = build_restricted_categories_set(group_rows, root_cats)
+            root_cats = CONFIG.get("age_restrictions", {}).get("root_categories", [])
+            restricted_cats = build_restricted_categories_set(group_rows, root_cats)
 
-        sql_ins_group = """
-        INSERT INTO invent_groups (group_code, group_name, parent_group_code, is_age_restricted) 
-        VALUES (%s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE 
-            group_name=VALUES(group_name), 
-            parent_group_code=VALUES(parent_group_code),
-            is_age_restricted=VALUES(is_age_restricted);
-        """
-        group_data = [
-            (
-                str(r.groupcode), 
-                r.groupname, 
-                str(r.parentgroupcode) if r.parentgroupcode else None,
-                1 if str(r.groupcode) in restricted_cats else 0
-            ) 
-            for r in group_rows
-        ]
-        mysql_cursor.executemany(sql_ins_group, group_data)
+            sql_ins_group = """
+            INSERT INTO invent_groups (group_code, group_name, parent_group_code, is_age_restricted) 
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE 
+                group_name=VALUES(group_name), 
+                parent_group_code=VALUES(parent_group_code),
+                is_age_restricted=VALUES(is_age_restricted);
+            """
+            group_data = [
+                (
+                    str(r.groupcode), 
+                    r.groupname, 
+                    str(r.parentgroupcode) if r.parentgroupcode else None,
+                    1 if str(r.groupcode) in restricted_cats else 0
+                ) 
+                for r in group_rows
+            ]
+            mysql_cursor.executemany(sql_ins_group, group_data)
 
         # 3. Синхронизация чистых товаров (items)
-        logger.info("Синхронизация items...")
-        sql_items = sql_loader.get_query("03_add_invent_item.sql")
-        mssql_cursor.execute(sql_items, (CONFIG["exchange"]["dept_code"],))
-        item_rows = mssql_cursor.fetchall()
+        if entities.get("items", True):
+            logger.info("Синхронизация items...")
+            sql_items = sql_loader.get_query("03_add_invent_item.sql")
+            mssql_cursor.execute(sql_items, (CONFIG["exchange"]["dept_code"],))
+            item_rows = mssql_cursor.fetchall()
 
-        sql_ins_item = """
-        INSERT INTO items (inventcode, name, measurecode, inventgroup, effectivedate) 
-        VALUES (%s, %s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE 
-            name=VALUES(name), 
-            measurecode=VALUES(measurecode),
-            inventgroup=VALUES(inventgroup);
-        """
-        item_data = [
-            (
-                str(r.inventcode), 
-                r.name, 
-                r.measurecode, 
-                str(r.inventgroup) if r.inventgroup else None,
-                r.effectivedate
-            ) 
-            for r in item_rows
-        ]
-        mysql_cursor.executemany(sql_ins_item, item_data)
+            sql_ins_item = """
+            INSERT INTO items (inventcode, name, measurecode, inventgroup, effectivedate) 
+            VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE 
+                name=VALUES(name), 
+                measurecode=VALUES(measurecode),
+                inventgroup=VALUES(inventgroup);
+            """
+            item_data = [
+                (
+                    str(r.inventcode), 
+                    r.name, 
+                    r.measurecode, 
+                    str(r.inventgroup) if r.inventgroup else None,
+                    r.effectivedate
+                ) 
+                for r in item_rows
+            ]
+            mysql_cursor.executemany(sql_ins_item, item_data)
 
         # 4. Синхронизация штрих-кодов
-        logger.info("Синхронизация barcodes...")
-        sql_barcodes = sql_loader.get_query("04_add_barcode.sql")
-        mssql_cursor.execute(sql_barcodes, (CONFIG["exchange"]["dept_code"],))
-        barcode_rows = mssql_cursor.fetchall()
+        if entities.get("barcodes", True):
+            logger.info("Синхронизация barcodes...")
+            sql_barcodes = sql_loader.get_query("04_add_barcode.sql")
+            mssql_cursor.execute(sql_barcodes, (CONFIG["exchange"]["dept_code"],))
+            barcode_rows = mssql_cursor.fetchall()
 
-        sql_ins_bar = """
-        INSERT INTO barcodes (barcode, inventcode, name, measure, tmctype, quantdefault) 
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE 
-            inventcode=VALUES(inventcode), 
-            name=VALUES(name), 
-            measure=VALUES(measure),
-            tmctype=VALUES(tmctype),
-            quantdefault=VALUES(quantdefault);
-        """
-        barcode_data = [
-            (
-                str(r.barcode), 
-                str(r.code), 
-                r.name, 
-                int(r.measure), 
-                int(r.tmctype), 
-                float(r.quantdefault)
-            ) 
-            for r in barcode_rows
-        ]
-        mysql_cursor.executemany(sql_ins_bar, barcode_data)
+            sql_ins_bar = """
+            INSERT INTO barcodes (barcode, inventcode, name, measure, tmctype, quantdefault) 
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE 
+                inventcode=VALUES(inventcode), 
+                name=VALUES(name), 
+                measure=VALUES(measure),
+                tmctype=VALUES(tmctype),
+                quantdefault=VALUES(quantdefault);
+            """
+            barcode_data = [
+                (
+                    str(r.barcode), 
+                    str(r.code), 
+                    r.name, 
+                    int(r.measure), 
+                    int(r.tmctype), 
+                    float(r.quantdefault)
+                ) 
+                for r in barcode_rows
+            ]
+            mysql_cursor.executemany(sql_ins_bar, barcode_data)
 
         # 5. Синхронизация розничных цен (prices)
-        logger.info("Синхронизация prices...")
-        sql_prices = sql_loader.get_query("05_add_price.sql")
-        mssql_cursor.execute(sql_prices, (CONFIG["exchange"]["dept_code"],))
-        price_rows = mssql_cursor.fetchall()
+        if entities.get("prices", True):
+            logger.info("Синхронизация prices...")
+            sql_prices = sql_loader.get_query("05_add_price.sql")
+            mssql_cursor.execute(sql_prices, (CONFIG["exchange"]["dept_code"],))
+            price_rows = mssql_cursor.fetchall()
 
-        sql_ins_price = """
-        INSERT INTO prices (barcode, price, minprice, pricetype, doctype, documentid, effectivedate) 
-        VALUES (%s, %s, %s, 3, 1, %s, %s)
-        ON DUPLICATE KEY UPDATE 
-            price=VALUES(price), 
-            minprice=VALUES(minprice),
-            documentid=VALUES(documentid);
-        """
-        price_data = [
-            (
-                str(r.barcode), 
-                r.price, 
-                r.price, 
-                str(CONFIG["exchange"]["dept_code"]),
-                r.effectivedate
-            ) 
-            for r in price_rows
-        ]
-        mysql_cursor.executemany(sql_ins_price, price_data)
+            sql_ins_price = """
+            INSERT INTO prices (barcode, price, minprice, pricetype, doctype, documentid, effectivedate) 
+            VALUES (%s, %s, %s, 3, 1, %s, %s)
+            ON DUPLICATE KEY UPDATE 
+                price=VALUES(price), 
+                minprice=VALUES(minprice),
+                documentid=VALUES(documentid);
+            """
+            price_data = [
+                (
+                    str(r.barcode), 
+                    r.price, 
+                    r.price, 
+                    str(CONFIG["exchange"]["dept_code"]),
+                    r.effectivedate
+                ) 
+                for r in price_rows
+            ]
+            mysql_cursor.executemany(sql_ins_price, price_data)
 
         # 6. Синхронизация уценки (additional_prices)
-        logger.info("Синхронизация additional_prices...")
-        sql_add_prices = sql_loader.get_query("06_add_additional_price.sql")
-        mssql_cursor.execute(sql_add_prices, (CONFIG["exchange"]["dept_code"],))
-        add_price_rows = mssql_cursor.fetchall()
+        if entities.get("additional_prices", True):
+            logger.info("Синхронизация additional_prices...")
+            sql_add_prices = sql_loader.get_query("06_add_additional_price.sql")
+            mssql_cursor.execute(sql_add_prices, (CONFIG["exchange"]["dept_code"],))
+            add_price_rows = mssql_cursor.fetchall()
 
-        sql_ins_add_price = """
-        INSERT INTO additional_prices (barcode, pricecode, additional_price, pricename, effectivedate) 
-        VALUES (%s, 1, %s, 'Уценка', %s)
-        ON DUPLICATE KEY UPDATE additional_price=VALUES(additional_price);
-        """
-        add_price_data = [(str(r.barcode), r.additional_price, r.effectivedate) for r in add_price_rows]
-        mysql_cursor.executemany(sql_ins_add_price, add_price_data)
+            sql_ins_add_price = """
+            INSERT INTO additional_prices (barcode, pricecode, additional_price, pricename, effectivedate) 
+            VALUES (%s, 1, %s, 'Уценка', %s)
+            ON DUPLICATE KEY UPDATE additional_price=VALUES(additional_price);
+            """
+            add_price_data = [(str(r.barcode), r.additional_price, r.effectivedate) for r in add_price_rows]
+            mysql_cursor.executemany(sql_ins_add_price, add_price_data)
 
         # 7. Синхронизация пиклиста
-        logger.info("Синхронизация picklist...")
-        stats = {"cache_hits": 0, "compressed_new": 0}
+        if entities.get("picklist", True):
+            logger.info("Синхронизация picklist...")
+            stats = {"cache_hits": 0, "compressed_new": 0}
 
-        sql_pick_cats = sql_loader.get_query("07_picklist_categories.sql")
-        mssql_cursor.execute(sql_pick_cats)
-        pick_cats = mssql_cursor.fetchall()
+            sql_pick_cats = sql_loader.get_query("07_picklist_categories.sql")
+            mssql_cursor.execute(sql_pick_cats)
+            pick_cats = mssql_cursor.fetchall()
 
-        sql_ins_picklist = """
-        INSERT INTO picklist (code, name, binary_id, parent, tmccode, barcode, is_category) 
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE 
-            name=VALUES(name), 
-            binary_id=VALUES(binary_id),
-            parent=VALUES(parent),
-            tmccode=VALUES(tmccode),
-            barcode=VALUES(barcode);
-        """
+            sql_ins_picklist = """
+            INSERT INTO picklist (code, name, binary_id, parent, tmccode, barcode, is_category) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE 
+                name=VALUES(name), 
+                binary_id=VALUES(binary_id),
+                parent=VALUES(parent),
+                tmccode=VALUES(tmccode),
+                barcode=VALUES(barcode);
+            """
 
-        pick_data = []
-        for r in pick_cats:
-            compress_image_to_base64(r.image_bytes, mysql_cache, r.binary_id, stats)
-            pick_data.append((str(r.code), r.name, r.binary_id, None, None, None, 1))
+            pick_data = []
+            for r in pick_cats:
+                compress_image_to_base64(r.image_bytes, mysql_cache, r.binary_id, stats)
+                pick_data.append((str(r.code), r.name, r.binary_id, None, None, None, 1))
 
-        sql_pick_items = sql_loader.get_query("08_picklist_items.sql")
-        mssql_cursor.execute(sql_pick_items)
-        pick_items = mssql_cursor.fetchall()
+            days_back = CONFIG.get("picklist", {}).get("days_back", 30)
+            now = datetime.now() 
+            start_date = now - timedelta(days=days_back) 
+            end_date = now
 
-        for r in pick_items:
-            compress_image_to_base64(r.image_bytes, mysql_cache, r.binary_id, stats)
-            pick_data.append((
-                str(r.raw_code).lstrip('0'), 
-                r.name, 
-                r.binary_id, 
-                str(r.parent) if r.parent else None,
-                str(r.tmccode).lstrip('0'),
-                str(r.barcode) if r.barcode else None,
-                0
-            ))
+            sql_pick_items = sql_loader.get_query("08_picklist_items.sql")
 
-        mysql_cursor.executemany(sql_ins_picklist, pick_data)
-        logger.info(f"Пиклист обработан. Кэш: hits={stats['cache_hits']}, new_compressed={stats['compressed_new']}")
+            mssql_cursor.execute(sql_pick_items, (start_date, end_date))
+            pick_items = mssql_cursor.fetchall()
+
+            for r in pick_items:
+                compress_image_to_base64(r.image_bytes, mysql_cache, r.binary_id, stats)
+                pick_data.append((
+                    str(r.raw_code).lstrip('0'), 
+                    r.name, 
+                    r.binary_id, 
+                    str(r.parent) if r.parent else None,
+                    str(r.tmccode).lstrip('0'),
+                    str(r.barcode) if r.barcode else None,
+                    0
+                ))
+
+            mysql_cursor.executemany(sql_ins_picklist, pick_data)
+            logger.info(f"Пиклист обработан. Кэш: hits={stats['cache_hits']}, new_compressed={stats['compressed_new']}")
 
 
         # 8. Синхронизация списка товаров СЗТ
-        logger.info("Синхронизация items_social...")
-        sql_add_item_social = sql_loader.get_query("09_add_item_social.sql")
-        mssql_cursor.execute(sql_add_item_social)
-        add_item_social_rows = mssql_cursor.fetchall()
+        if entities.get("items_social", True):
+            logger.info("Синхронизация items_social...")
+            sql_add_item_social = sql_loader.get_query("09_add_item_social.sql")
+            mssql_cursor.execute(sql_add_item_social)
+            add_item_social_rows = mssql_cursor.fetchall()
 
-        # Используем INSERT IGNORE для пропуска уже существующих записей
-        sql_ins_add_item_social = """
-        INSERT IGNORE INTO items_social (inventcode) 
-        VALUES (%s);
-        """
+            # Используем INSERT IGNORE для пропуска уже существующих записей
+            sql_ins_add_item_social = """
+            INSERT IGNORE INTO items_social (inventcode) 
+            VALUES (%s);
+            """
 
-        add_item_social_data = [(str(r.inventcode),) for r in add_item_social_rows]
+            add_item_social_data = [(str(r.inventcode),) for r in add_item_social_rows]
 
-        mysql_cursor.executemany(sql_ins_add_item_social, add_item_social_data)
-
-
-
+            mysql_cursor.executemany(sql_ins_add_item_social, add_item_social_data)
 
     finally:
         mssql_cursor.close()
@@ -463,10 +472,27 @@ def sync_mssql_to_mysql(mssql_conn, mysql_cache):
 # 6. ЭТАП 2: ВЫГРУЗКА ИЗ MYSQL (martin_etl -> pos.aif)
 # ==============================================================================
 def generate_aif_from_local_db(mysql_cache):
+    mode = CONFIG.get("mode", {})
     logger.info(">>> СТАРТ ЭТАПА 2: Формирование pos.aif из MySQL (martin_etl)")
     conn = mysql_cache.get_connection()
     cursor = conn.cursor(dictionary=True)
     commands = []
+
+    if mode.get("full", True):
+        clear_entities = CONFIG.get("entities", {})
+        
+        if clear_entities.get("units", True):
+            commands.append({"command": "clearUnit"})
+        if clear_entities.get("groups", True):
+            commands.append({"command": "clearInventGroup"})
+        if clear_entities.get("items", True):
+            commands.append({"command": "clearInventory"})
+        if clear_entities.get("prices", True):
+            commands.append({"command": "clearPrice"})
+        if clear_entities.get("additional_prices", True):
+            commands.append({"command": "clearAdditionalPrice"})
+        if clear_entities.get("picklist", True):
+            commands.append({"command": "clearPicklist"})
 
     try:
         # 1. Единицы измерения
@@ -536,7 +562,7 @@ def generate_aif_from_local_db(mysql_cache):
         SELECT 
             p.code, 
             p.name, 
-            p.parent, 
+            p.parent,
             p.tmccode, 
             p.barcode, 
             c.base64_data AS image,

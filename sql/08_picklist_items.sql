@@ -29,6 +29,6 @@ INNER JOIN (
     SELECT s_sub.[MATNR], ROW_NUMBER() OVER (PARTITION BY s_sub.[MATNR] ORDER BY s_sub.[timestamp] DESC) AS rn
     FROM [GPBO].[dbo].[BO_Stock_On_Hand] s_sub
     -- Условие наличий движения по товару за указанный период 
-    WHERE s_sub.[timestamp] >= '2026-01-01' AND s_sub.[timestamp] < '2026-01-12'
+    WHERE s_sub.[timestamp] >= ? AND s_sub.[timestamp] < ?
 ) stk ON stk.[MATNR] = gp_item.[ItemCode] AND stk.rn = 1
 WHERE cpos.[DeletionDate] IS NULL AND cpos.[ItemId] IS NOT NULL;
