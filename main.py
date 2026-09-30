@@ -200,16 +200,17 @@ def compress_image_to_base64(image_bytes, cache_mgr, binary_id, stats_dict):
         stats_dict["compressed_new"] += 1
         img = Image.open(BytesIO(image_bytes))
 
-        # Конвертация RGBA в RGB на белом фоне
+        # Если есть прозрачность (RGBA/P), накладываем на белый фон и переводим в RGB
         if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
             background = Image.new("RGB", img.size, (255, 255, 255))
             if img.mode == "P":
                 img = img.convert("RGBA")
-            background.paste(img, mask=img.split() if img.mode == "RGBA" else None)
+            background.paste(img, mask=img.split()[3]) # Используем альфа-канал как маску
             img = background
         elif img.mode != "RGB":
             img = img.convert("RGB")
 
+        # Ресемплинг
         try:
             resample_filter = Image.Resampling.LANCZOS
         except AttributeError:
@@ -323,15 +324,15 @@ def sync_mssql_to_mysql(mssql_conn, mysql_cache):
             item_rows = mssql_cursor.fetchall()
 
             sql_ins = """
-            INSERT INTO items (inventcode, name, measurecode, inventgroup, is_present) 
-            VALUES (%s, %s, %s, %s, 1)
+            INSERT INTO items (inventcode, name, measurecode, inventgroup, effectivedate, is_present) 
+            VALUES (%s, %s, %s, %s, %s, 1)
             ON DUPLICATE KEY UPDATE 
                 name=VALUES(name), 
                 measurecode=VALUES(measurecode),
                 inventgroup=VALUES(inventgroup),
                 is_present=1;
             """
-            item_data = [(str(r.inventcode), r.name, r.measurecode, str(r.inventgroup) if r.inventgroup else None) for r in item_rows]
+            item_data = [(str(r.inventcode), r.name, r.measurecode, str(r.inventgroup) if r.inventgroup else None, r.effectivedate) for r in item_rows]
             mysql_cursor.executemany(sql_ins, item_data)
 
         # 4. Штрих-коды (barcodes)
@@ -365,15 +366,15 @@ def sync_mssql_to_mysql(mssql_conn, mysql_cache):
             price_rows = mssql_cursor.fetchall()
 
             sql_ins = """
-            INSERT INTO prices (barcode, price, minprice, pricetype, doctype, documentid, is_present) 
-            VALUES (%s, %s, %s, 3, 1, %s, 1)
+            INSERT INTO prices (barcode, price, minprice, pricetype, doctype, documentid, effectivedate, is_present) 
+            VALUES (%s, %s, %s, 3, 1, %s, %s, 1)
             ON DUPLICATE KEY UPDATE 
                 price=VALUES(price), 
                 minprice=VALUES(minprice),
                 documentid=VALUES(documentid),
                 is_present=1;
             """
-            price_data = [(str(r.barcode), r.price, r.price, str(dept_code)) for r in price_rows]
+            price_data = [(str(r.barcode), r.price, r.price, str(dept_code), r.effectivedate) for r in price_rows]
             mysql_cursor.executemany(sql_ins, price_data)
 
         # 6. Уценка (additional_prices)
@@ -385,13 +386,13 @@ def sync_mssql_to_mysql(mssql_conn, mysql_cache):
             add_price_rows = mssql_cursor.fetchall()
 
             sql_ins = """
-            INSERT INTO additional_prices (barcode, pricecode, additional_price, pricename, is_present) 
-            VALUES (%s, 1, %s, 'Уценка', 1)
+            INSERT INTO additional_prices (barcode, pricecode, additional_price, pricename, effectivedate, is_present) 
+            VALUES (%s, 1, %s, 'Уценка', %s, 1)
             ON DUPLICATE KEY UPDATE 
                 additional_price=VALUES(additional_price),
                 is_present=1;
             """
-            add_price_data = [(str(r.barcode), r.additional_price) for r in add_price_rows]
+            add_price_data = [(str(r.barcode), r.additional_price, r.effectivedate) for r in add_price_rows]
             mysql_cursor.executemany(sql_ins, add_price_data)
 
         # 7. Товары СЗТ (items_social)
@@ -487,6 +488,7 @@ def generate_aif_from_local_db(mysql_cache):
             if entities.get("units", True): commands.append({"command": "clearUnit"})
             if entities.get("groups", True): commands.append({"command": "clearInventGroup"})
             if entities.get("items", True): commands.append({"command": "clearInventory"})
+            if entities.get("barcodes", True): commands.append({"command": "clearBarcode"})
             if entities.get("prices", True): commands.append({"command": "clearPrice"})
             if entities.get("additional_prices", True): commands.append({"command": "clearAdditionalPrice"})
             if entities.get("picklist", True): commands.append({"command": "clearPicklist"})
@@ -546,7 +548,7 @@ def generate_aif_from_local_db(mysql_cache):
             for r in cursor.fetchall():
                 commands.append({
                     "command": "addInventItem",
-                    "inventItem": {
+                    "invent": {
                         "inventcode": r["inventcode"],
                         "measurecode": str(r["measurecode"]),
                         "isInventItem": True,
@@ -569,7 +571,7 @@ def generate_aif_from_local_db(mysql_cache):
         if entities.get("prices", True):
             cursor.execute("SELECT barcode, price, minprice, pricetype, doctype, documentid FROM prices WHERE is_present = 1;")
             for r in cursor.fetchall():
-                commands.append({"command": "addPrice", "price": {"barcode": r["barcode"], "price": str(r["price"]), "minprice": str(r["minprice"]), "pricetype": r["pricetype"], "doctype": r["doctype"], "documentid": r["documentid"]}})
+                commands.append({"command": "addPrice", "price": {"barcode": r["barcode"], "price": str(r["price"]), "pricetype": r["pricetype"], "doctype": r["doctype"], "documentid": r["documentid"]}})
 
         if entities.get("additional_prices", True):
             cursor.execute("SELECT barcode, pricecode, additional_price, pricename FROM additional_prices WHERE is_present = 1;")
